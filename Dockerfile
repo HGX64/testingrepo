@@ -1,19 +1,13 @@
 FROM python:3.9
 
-# Instalar Chrome
-RUN wget -q -O - https://dl-ssl.google.com/linux/linux_signing_key.pub | apt-key add - \
-    && echo "deb http://dl.google.com/linux/chrome/deb/ stable main" >> /etc/apt/sources.list.d/google.list \
-    && apt-get update \
-    && apt-get install -y google-chrome-stable \
+# Instalar dependencias necesarias
+RUN apt-get update && apt-get install -y \
+    wget \
+    unzip \
+    xvfb \
+    chromium \
+    chromium-driver \
     && rm -rf /var/lib/apt/lists/*
-
-# Instalar chromedriver
-RUN CHROME_VERSION=$(google-chrome --version | awk '{print $3}' | awk -F'.' '{print $1}') \
-    && wget -q "https://chromedriver.storage.googleapis.com/LATEST_RELEASE_${CHROME_VERSION}" -O - | xargs -I{} wget -q "https://chromedriver.storage.googleapis.com/{}/chromedriver_linux64.zip" \
-    && unzip chromedriver_linux64.zip \
-    && mv chromedriver /usr/local/bin/ \
-    && chmod +x /usr/local/bin/chromedriver \
-    && rm chromedriver_linux64.zip
 
 WORKDIR /app
 
@@ -23,6 +17,10 @@ RUN pip install -r requirements.txt
 
 # Copiar el resto del código
 COPY . .
+
+# Variables de entorno para Chrome
+ENV CHROME_BIN=/usr/bin/chromium
+ENV CHROMEDRIVER_PATH=/usr/bin/chromedriver
 
 # Comando para ejecutar el bot
 CMD ["python", "wallapop_bot.py"]

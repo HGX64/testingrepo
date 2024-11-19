@@ -1,3 +1,5 @@
+import os
+import time
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
@@ -5,16 +7,15 @@ from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import TimeoutException, NoSuchElementException
-from selenium.webdriver import ActionChains
-import time
-import sys
-import json
+from selenium.common.exceptions import TimeoutException, NoSuchElementException, ElementClickInterceptedException
+from selenium.webdriver.common.action_chains import ActionChains
+import undetected_chromedriver as uc
 from datetime import datetime
 import argparse
 import csv
-import os
 import traceback
+import json
+import sys
 
 class WallapopScraper:
     def __init__(self, search_term, location=None):
@@ -22,18 +23,43 @@ class WallapopScraper:
         self.location = location if location else "madrid"
         self.base_url = "https://es.wallapop.com"
         self.search_url = self._build_search_url()
-        self.headless = False
+        self.headless = True
         self.driver = None
         self.wait = None
         self.results = []
         self.last_height = 0
         self.no_new_items_count = 0
-        self.max_scrolls = None
-        self.save_directory = "./"
-        self.load_images = True
+        self.max_scrolls = 3
+        self.save_directory = "resultados"
+        self.load_images = False
         self.price_min = None
         self.price_max = None
         self.debug = False
+
+        # Configuración del driver
+        options = uc.ChromeOptions()
+        options.binary_location = os.getenv('CHROME_BIN', '/usr/bin/chromium')
+        options.add_argument('--headless')
+        options.add_argument('--no-sandbox')
+        options.add_argument('--disable-dev-shm-usage')
+        
+        if not self.load_images:
+            prefs = {"profile.managed_default_content_settings.images": 2}
+            options.add_experimental_option("prefs", prefs)
+        
+        try:
+            self.driver = uc.Chrome(
+                driver_executable_path=os.getenv('CHROMEDRIVER_PATH', '/usr/bin/chromedriver'),
+                options=options,
+                version_main=119  # Especificar versión para evitar warning
+            )
+            # Inicializar el wait después de crear el driver
+            self.wait = WebDriverWait(self.driver, 15)
+            if self.debug:
+                print("✓ Driver inicializado correctamente")
+        except Exception as e:
+            print(f"Error al inicializar el driver: {str(e)}")
+            raise
 
     def _build_search_url(self):
         """Construye la URL de búsqueda con los parámetros especificados"""
@@ -41,49 +67,31 @@ class WallapopScraper:
         search_term_encoded = quote(self.search_term)
         return f"{self.base_url}/app/search?keywords={search_term_encoded}&latitude=40.4168&longitude=-3.7038"
 
-    def _setup_driver(self):
-        """Configura el driver de Chrome con las opciones necesarias"""
-        try:
-            options = Options()
-            if self.headless:
-                options.add_argument('--headless')
-                options.add_argument('--disable-gpu')
-                options.add_argument('--window-size=1920,1080')
-            options.add_argument('--no-sandbox')
-            options.add_argument('--disable-dev-shm-usage')
-            
-            if not self.load_images:
-                options.add_argument('--blink-settings=imagesEnabled=false')
-
-            self.driver = webdriver.Chrome(options=options)
-            self.wait = WebDriverWait(self.driver, 15)
-            
-            if self.debug:
-                print("✓ Configuración del navegador:")
-                print(f"  - Headless: {'Sí' if self.headless else 'No'}")
-                print(f"  - Cargar imágenes: {'No' if not self.load_images else 'Sí'}")
-                print(f"  - Max scrolls: {self.max_scrolls if self.max_scrolls else 'Sin límite'}")
-            else:
-                print("✓ Navegador configurado correctamente")
-
-        except Exception as e:
-            print(f"Error al configurar el navegador: {str(e)}")
-            if self.debug:
-                print("Stacktrace completo:")
-                print(traceback.format_exc())
-            raise
-
     def accept_cookies(self):
         """Acepta las cookies si aparece el diálogo"""
         try:
-            cookie_button = self.wait.until(
+            # Esperar hasta 10 segundos a que aparezca el botón de cookies
+            cookie_button = WebDriverWait(self.driver, 10).until(
                 EC.element_to_be_clickable((By.ID, "onetrust-accept-btn-handler"))
             )
-            cookie_button.click()
+            # Intentar hacer click
+            try:
+                cookie_button.click()
+                if self.debug:
+                    print("✓ Cookies aceptadas")
+            except ElementClickInterceptedException:
+                # Si falla el click normal, intentar con JavaScript
+                self.driver.execute_script("arguments[0].click();", cookie_button)
+                if self.debug:
+                    print("✓ Cookies aceptadas (usando JavaScript)")
+        except TimeoutException:
             if self.debug:
-                print("✓ Cookies aceptadas")
+                print("⚠️ No se encontró el diálogo de cookies")
+            pass  # No hay problema si no aparece el diálogo de cookies
         except Exception as e:
-            print(f"Error al aceptar cookies: {str(e)}")
+            if self.debug:
+                print(f"⚠️ Error al aceptar cookies: {str(e)}")
+            pass  # Continuar incluso si hay error con las cookies
 
     def click_load_more(self):
         """Hace click en el botón 'Ver más productos' si está disponible"""
@@ -175,39 +183,32 @@ class WallapopScraper:
     def extract_product_info(self, card):
         """Extrae la información de un producto individual"""
         try:
-            # Esperar a que el elemento sea visible
-            WebDriverWait(self.driver, 5).until(
-                EC.visibility_of(card)
-            )
-
-            # Extraer título
+            # Extraer título y link
             try:
                 title = card.find_element(By.CSS_SELECTOR, "p.ItemCard__title").text.strip()
+                link = card.find_element(By.XPATH, "./ancestor::a[1]").get_attribute("href")
             except NoSuchElementException:
-                title = "Título no disponible"
+                if self.debug:
+                    print("No se encontró título o link")
+                return None
 
             # Extraer precio
             try:
                 price = card.find_element(By.CSS_SELECTOR, "span.ItemCard__price").text.strip()
             except NoSuchElementException:
-                price = "Precio no disponible"
+                price = "0"
+                if self.debug:
+                    print("No se encontró el precio")
 
-            # Extraer link del producto
-            try:
-                link = card.find_element(By.XPATH, "./ancestor::a[1]").get_attribute("href")
-            except NoSuchElementException:
-                link = "Link no disponible"
-
-            # Extraer descripción (que en este caso es el mismo título ya que no hay descripción separada)
-            description = title
-
-            # Extraer ubicación (si está disponible)
+            # Extraer ubicación
             try:
                 location = card.find_element(By.CSS_SELECTOR, ".ItemCard__location").text.strip()
             except NoSuchElementException:
                 location = "Ubicación no disponible"
+                if self.debug:
+                    print("No se encontró la ubicación")
 
-            # Comprobar si está reservado (buscar en diferentes lugares)
+            # Comprobar si está reservado (usando los tres métodos)
             reserved = False
             try:
                 # Método 1: Buscar el badge directamente
@@ -241,61 +242,71 @@ class WallapopScraper:
                         reserved = True
 
             except Exception as e:
+                if self.debug:
+                    print(f"Error al comprobar si está reservado: {str(e)}")
                 reserved = False
 
+            # Si falta algún campo esencial, no incluir el producto
+            if not title or not link:
+                if self.debug:
+                    print("Falta título o link")
+                return None
+
+            # Limpiar el precio (quitar el símbolo € y espacios)
+            price = price.replace("€", "").strip()
+            
+            # Devolver los campos necesarios incluyendo reserved
             return {
                 "title": title,
-                "price": price.replace("€", "").strip(),  # Limpiamos el precio
-                "description": description,
+                "price": price,
                 "location": location,
                 "link": link,
-                "reserved": reserved,
-                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                "reserved": "Sí" if reserved else "No"
             }
+
         except Exception as e:
-            print(f"Error al extraer información del producto: {str(e)}")
+            if self.debug:
+                print(f"Error detallado al extraer información: {str(e)}")
+                import traceback
+                print(traceback.format_exc())
             return None
 
     def save_results(self):
-        """Guarda los resultados en archivos CSV y JSON"""
-        if not self.results:
-            print("No hay resultados para guardar")
-            return
-
+        """Guarda los resultados en archivo CSV y devuelve la ruta del archivo"""
         try:
+            if not self.results:
+                print("No hay resultados para guardar")
+                return None
+
             # Crear directorio si no existe
             os.makedirs(self.save_directory, exist_ok=True)
+            
+            # Generar nombre de archivo con timestamp
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            csv_filename = os.path.join(self.save_directory, f"wallapop_{self.search_term}_{timestamp}.csv")
+            
+            # Filtrar solo los campos que queremos en el CSV
+            filtered_results = []
+            for result in self.results:
+                filtered_result = {
+                    'title': result['title'],
+                    'price': result['price'],
+                    'location': result['location'],
+                    'link': result['link'],
+                    'reserved': result['reserved']
+                }
+                filtered_results.append(filtered_result)
             
             # Guardar en CSV
-            csv_filename = f"{self.save_directory}/wallapop_{self.search_term}_{timestamp}.csv"
             with open(csv_filename, 'w', newline='', encoding='utf-8') as f:
-                writer = csv.DictWriter(f, fieldnames=["title", "price", "description", "location", "link", "reserved", "timestamp"])
+                writer = csv.DictWriter(f, fieldnames=['title', 'price', 'location', 'link', 'reserved'])
                 writer.writeheader()
-                writer.writerows(self.results)
+                writer.writerows(filtered_results)
             
-            # Guardar en JSON también por si acaso
-            json_filename = f"{self.save_directory}/wallapop_{self.search_term}_{timestamp}.json"
-            with open(json_filename, 'w', encoding='utf-8') as f:
-                json.dump(self.results, f, ensure_ascii=False, indent=2)
+            print(f"\n✓ Resultados guardados en: {csv_filename}")
             
-            print(f"✓ Resultados guardados en:")
-            print(f"  - CSV: {csv_filename}")
-            print(f"  - JSON: {json_filename}")
-            
-            # Mostrar resumen de resultados
-            print(f"\n📊 Resumen de resultados:")
-            print(f"  - Total de productos encontrados: {len(self.results)}")
-            
-            # Calcular precio promedio (excluyendo productos sin precio)
-            prices = []
-            for item in self.results:
-                try:
-                    price = float(item['price'].replace(',', '.').strip())
-                    prices.append(price)
-                except (ValueError, AttributeError):
-                    continue
-            
+            # Mostrar estadísticas de precios
+            prices = [float(r['price'].replace(',', '.')) for r in self.results if r['price'].replace(',', '.').replace('.', '').isdigit()]
             if prices:
                 avg_price = sum(prices) / len(prices)
                 min_price = min(prices)
@@ -304,13 +315,15 @@ class WallapopScraper:
                 print(f"  - Precio mínimo: {min_price:.2f}€")
                 print(f"  - Precio máximo: {max_price:.2f}€")
             
+            return csv_filename
+            
         except Exception as e:
             print(f"Error al guardar resultados: {str(e)}")
+            return None
 
     def scrape(self):
         """Realiza el scraping principal"""
         try:
-            self._setup_driver()
             print(f"→ Buscando '{self.search_term}' en Wallapop...")
             
             self.driver.get(self.search_url)
